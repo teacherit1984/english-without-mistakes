@@ -12,7 +12,7 @@ import io
 app = FastAPI(title="Английский без ошибок")
 
 # --- НАСТРОЙКИ YANDEX GPT ---
-YANDEX_API_KEY = "AQVNxkplrqzodr_tc8NnkscqVg8zCRJwy9ztSRwn"
+YANDEX_API_KEY = ""
 FOLDER_ID = "b1g0ho3tlf5cf9sibok4"
 
 # --- НАСТРОЙКИ УЧЕБНИКОВ И OCR ---
