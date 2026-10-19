@@ -17,12 +17,11 @@ def clean_text(text: str) -> str:
 
 async def send_menu(message):
     buttons = [
-        [CallbackButton(text=f"Spotlight {c}", payload=f"grade:{c}")] 
-        for c in ['5','6','7','8','9','10','11']
+        [CallbackButton(text="Spotlight 10", payload="grade:10")]
     ]
     keyboard = ButtonsPayload(buttons=buttons).pack()
     await message.answer(
-        text="Выбери класс или напиши тему:\n\nПримеры:\n- 22 (если класс выбран)\n- стр. 45, 9 класс\n- объясни Present Simple",
+        text="Выбери класс или напиши тему:\n\nПримеры:\n- 22 (номер страницы)\n- стр. 45\n- объясни Present Simple",
         attachments=[keyboard]
     )
 
@@ -36,15 +35,15 @@ async def handle_all(event: MessageCreated):
     user_id = message.sender.user_id if message.sender else None
 
     if text.lower() == "/start":
-        await message.answer("Привет! Я помогу с английским по Spotlight 5-11.")
+        await message.answer("Привет! Я помогу с английским по Spotlight 10.")
         await send_menu(message)
         return
 
-    if text.isdigit() and 5 <= int(text) <= 11:
+    if text.isdigit() and int(text) == 10:
         if not (user_id and user_id in user_state and user_state[user_id].get('grade')):
             if user_id:
-                user_state[user_id] = {'grade': text}
-            await message.answer(f"Выбран {text} класс! Напиши страницу или тему.")
+                user_state[user_id] = {'grade': '10'}
+            await message.answer("Выбран 10 класс! Напиши страницу или тему.")
             return
 
     try:
