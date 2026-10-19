@@ -15,6 +15,8 @@ OVERLAP = 100
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 def extract_text_from_pdf(path):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    
     doc = fitz.open(path)
     full_text = ""
     
@@ -30,7 +32,7 @@ def extract_text_from_pdf(path):
                 print(f"Страница {page_num + 1}: распознано через OCR ({len(text)} симв.)")
             except Exception as e:
                 print(f"Страница {page_num + 1}: ошибка OCR - {e}")
-                text = f"[PAGE {page_num + 1}] Пустая страница или ошибка распознавания"
+                text = f"[PAGE {page_num + 1}] Ошибка распознавания"
         else:
             print(f"Страница {page_num + 1}: текст извлечен ({len(text)} симв.)")
             
@@ -63,7 +65,7 @@ def create_vector_db():
     text = extract_text_from_pdf(BOOK_PATH)
     
     if len(text.strip()) < 100:
-        print("ВНИМАНИЕ: Извлечено очень мало текста. Возможно, PDF состоит из картинок.")
+        print("ВНИМАНИЕ: Извлечено очень мало текста.")
         
     chunks = split_text_into_chunks(text)
     print(f"Разбито на {len(chunks)} фрагментов.")
