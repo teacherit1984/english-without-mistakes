@@ -44,8 +44,8 @@ def _read_pdf_sync(file_path: str, page_num: int) -> str:
 
 
 async def get_ai_explanation(topic: str, default_grade: str = None) -> str:
-    grade = default_grade or "10"
-    book_file = f"spotlight_{grade}.pdf"
+    grade = "10"
+    book_file = "spotlight_10.pdf"
     page_num = None
 
     match = re.search(r'(?:страниц[аеу]|стр\.|с\.)\s*(\d+)', topic, re.IGNORECASE)
@@ -63,7 +63,7 @@ async def get_ai_explanation(topic: str, default_grade: str = None) -> str:
         file_path = os.path.join(BOOKS_DIR, book_file)
         if os.path.exists(file_path):
             text_from_pdf = await asyncio.to_thread(_read_pdf_sync, file_path, page_num)
-    
+
     if not text_from_pdf:
         rag_context = await search_context(topic, grade)
 
