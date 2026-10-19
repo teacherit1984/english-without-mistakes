@@ -1,0 +1,71 @@
+import os
+import json
+import fitz
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+BOOK_PATH = "books/spotlight_10.pdf"
+DB_DIR = "vector_db"
+CHUNK_SIZE = 300
+OVERLAP = 50
+
+
+def extract_text_from_pdf(path):
+    doc = fitz.open(path)
+    full_text = ""
+    for page_num in range(len(doc)):
+        text = doc[page_num].get_text()
+        if len(text.strip()) < 50:
+            pass
+        full_text += f"\n[PAGE {page_num + 1}]\n{text}"
+    doc.close()
+    return full_text
+
+
+def split_text_into_chunks(text, size=CHUNK_SIZE, overlap=OVERLAP):
+    words = text.split()
+    chunks = []
+    current_chunk = []
+
+    for word in words:
+        current_chunk.append(word)
+        if len(" ".join(current_chunk)) >= size:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = current_chunk[-overlap:]
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    return chunks
+
+
+def create_vector_db():
+    print(f"Читаем {BOOK_PATH}...")
+    if not os.path.exists(BOOK_PATH):
+        print(f"ОШИБКА: Файл {BOOK_PATH} не найден!")
+        return
+
+    text = extract_text_from_pdf(BOOK_PATH)
+    chunks = split_text_into_chunks(text)
+    print(f"Разбито на {len(chunks)} фрагментов.")
+
+    print("Создаем эмбеддинги (это может занять минуту)...")
+    model = SentenceTransformer('sentence-transformers/LaBSE')
+    embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=True)
+
+    print("Сохраняем базу данных...")
+    os.makedirs(DB_DIR, exist_ok=True)
+
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
+    faiss.write_index(index, os.path.join(DB_DIR, "spotlight_10.index"))
+
+    with open(os.path.join(DB_DIR, "chunks.json"), "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False)
+
+    print(f"Готово! База сохранена в папке {DB_DIR}")
+
+
+if __name__ == "__main__":
+    create_vector_db()
