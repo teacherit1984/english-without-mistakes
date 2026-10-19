@@ -4,6 +4,7 @@ import io
 import asyncio
 import aiohttp
 from dotenv import load_dotenv
+from rag import search_context
 
 load_dotenv()
 
@@ -11,7 +12,7 @@ YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")
 FOLDER_ID = os.getenv("FOLDER_ID")
 BOOKS_DIR = "books"
 
-TESSERACT_PATH = r"D:\Tesseract-OCR\tesseract.exe"
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 TESSERACT_AVAILABLE = os.path.exists(TESSERACT_PATH)
 
 
@@ -56,18 +57,26 @@ async def get_ai_explanation(topic: str, default_grade: str = None) -> str:
             page_num = num
 
     text_from_pdf = ""
+    rag_context = ""
+
     if page_num:
         file_path = os.path.join(BOOKS_DIR, book_file)
         if os.path.exists(file_path):
             text_from_pdf = await asyncio.to_thread(_read_pdf_sync, file_path, page_num)
+    
+    if not text_from_pdf:
+        rag_context = await search_context(topic, grade)
 
-    if page_num and not text_from_pdf:
+    if page_num and not text_from_pdf and not rag_context:
         return (f"Не могу прочитать страницу {page_num} из {grade} класса. "
                 f"Возможно, это скан низкого качества. Попробуй написать тему словами.")
 
     if text_from_pdf:
         prompt = (f"Материал со стр. {page_num} ({grade} класс):\n{text_from_pdf}\n\n"
                   f"Объясни просто, как ученик. Без вступлений и слов 'нейросеть'.")
+    elif rag_context:
+        prompt = (f"Контекст из учебника {grade} класса:\n{rag_context}\n\n"
+                  f"Запрос: {topic}. Объясни на основе этого текста просто, как ученик.")
     else:
         prompt = (f"Запрос: {topic}. Объясни как ученик {grade} класса. "
                   f"Без вступлений, без 'конечно', без 'ИИ'.")
