@@ -21,7 +21,12 @@ async def send_menu(message):
     ]
     keyboard = ButtonsPayload(buttons=buttons).pack()
     await message.answer(
-        text="Выбери класс или напиши тему:\n\nПримеры:\n- 22 (номер страницы)\n- стр. 45\n- объясни Present Simple",
+        text="👋 Привет! Я твой помощник по английскому.\n\n"
+             "Какую страницу или тему из учебника 10 класса объяснить?\n\n"
+             "💡 Примеры запросов:\n"
+             "• 52 — разбор страницы\n"
+             "• Module 3 — о чём текст и новые слова\n"
+             "• Present Simple — правило простыми словами",
         attachments=[keyboard]
     )
 
