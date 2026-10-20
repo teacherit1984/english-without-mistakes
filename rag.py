@@ -12,6 +12,7 @@ _model = None
 _index = None
 _chunks = None
 
+
 def _load_db():
     global _model, _index, _chunks
     if _model is None:
@@ -23,15 +24,16 @@ def _load_db():
         with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
             _chunks = json.load(f)
 
-async def search_context(query: str, grade: str = "10", top_k: int = 3) -> str:
+
+async def search_context(query: str, grade: str = "10", top_k: int = 1) -> str:
     try:
         _load_db()
         if _index is None or _chunks is None:
             return ""
-        
+
         query_embedding = _model.encode([query], convert_to_numpy=True)
         distances, indices = _index.search(query_embedding, top_k)
-        
+
         results = []
         found_indices = []
         for idx in indices[0]:
@@ -39,11 +41,11 @@ async def search_context(query: str, grade: str = "10", top_k: int = 3) -> str:
             if 0 <= clean_idx < len(_chunks):
                 results.append(_chunks[clean_idx])
                 found_indices.append(clean_idx)
-                
+
         print(f"[RAG DEBUG] Найдены чанки по индексам: {found_indices}")
         if results:
             print(f"[RAG DEBUG] Первый найденный фрагмент: {results[0][:100]}...")
-            
+
         return "\n\n---\n\n".join(results) if results else ""
     except Exception as e:
         print(f"Ошибка поиска в RAG: {e}")
