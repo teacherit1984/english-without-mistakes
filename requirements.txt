@@ -1,10 +1,6 @@
 maxapi
-python-dotenv
-pymupdf
-aiohttp
-Pillow
+PyMuPDF
 pytesseract
-faiss-cpu
-sentence-transformers
-numpy
-requests
+Pillow
+aiohttp
+python-dotenv
