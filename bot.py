@@ -7,13 +7,16 @@ import asyncio
 import logging
 import aiohttp
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from PIL import Image
 import pytesseract
 import fitz
 from maxapi import Bot, Dispatcher
 from maxapi.types.attachments.buttons import CallbackButton
 from maxapi.types.attachments.attachment import ButtonsPayload
+
+# ОТКЛЮЧАЕМ ЗАЩИТУ ОТ "БОМБ" В PILLOW
+Image.MAX_IMAGE_PIXELS = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,17 +28,22 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("MAX_BOT_TOKEN")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")
 FOLDER_ID = os.getenv("FOLDER_ID")
-BOOKS_DIR = "/home/user/books"
-USERS_FILE = "/home/user/users.json"
+
+USERS_FILE = "/app/users.json" if os.path.exists("/app/users.json") else "/home/user/users.json"
+BOOKS_DIR = "/app/books" if os.path.exists("/app/books") else "/home/user/books"
 
 ADMIN_USER_IDS = {6032271, 442430152, 382510789}
+
+HARDCODED_NAMES = {
+    6032271: "Александр Иванович",
+    442430152: "Кирилл",
+    202516127: "Елизавета"
+}
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-active_chats = set()
-lock = asyncio.Lock()
-message_lock = asyncio.Lock()
+chat_locks = {}
 stats = {"requests": 0, "ocr_runs": 0, "quiz_played": 0}
 admin_states = {}
 user_states = {}
@@ -46,6 +54,15 @@ quiz_sessions = {}
 
 os.makedirs(BOOKS_DIR, exist_ok=True)
 REGISTRY_FILE = os.path.join(BOOKS_DIR, "registry.json")
+
+def get_moscow_time():
+    moscow_tz = timezone(timedelta(hours=3))
+    return datetime.now(moscow_tz).strftime("%d.%m.%Y %H:%M")
+
+def get_chat_lock(chat_id):
+    if chat_id not in chat_locks:
+        chat_locks[chat_id] = asyncio.Lock()
+    return chat_locks[chat_id]
 
 def load_json(filepath, default=None):
     if default is None: default = {}
@@ -70,19 +87,23 @@ def register_user(user_id, user_name):
     if not user_id: return
     users = load_users()
     uid = str(user_id)
+    final_name = HARDCODED_NAMES.get(user_id, user_name if user_name else "")
     if uid not in users:
         users[uid] = {
-            "name": user_name or "Неизвестно",
-            "first_seen": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            "name": final_name,
+            "first_seen": get_moscow_time(),
             "quizzes": [],
             "best_score": 0
         }
         save_users(users)
-    elif user_name and users[uid].get("name") != user_name:
-        users[uid]["name"] = user_name
+    elif final_name and users[uid].get("name") != final_name:
+        users[uid]["name"] = final_name
         save_users(users)
 
 def get_user_name(event):
+    uid = get_user_id(event)
+    if uid and uid in HARDCODED_NAMES:
+        return HARDCODED_NAMES[uid]
     msg = getattr(event, 'message', None)
     if msg:
         sender = getattr(msg, 'sender', None)
@@ -97,6 +118,10 @@ def get_user_name(event):
     if user:
         name = getattr(user, 'first_name', None) or getattr(user, 'name', None)
         if name: return name
+    if uid:
+        users = load_users()
+        if str(uid) in users:
+            return users[str(uid)].get("name")
     return None
 
 def get_user_id(event):
@@ -219,7 +244,6 @@ def get_class_menu_keyboard(class_num):
     return ButtonsPayload(buttons=buttons).pack()
 
 def get_admin_keyboard():
-    # Убрали кнопку "Выйти", оставили "Назад в меню"
     buttons = [
         [CallbackButton(text="🏆 Топ пользователей", payload="admin_stats")],
         [CallbackButton(text="👥 Пользователи", payload="admin_users")],
@@ -250,20 +274,28 @@ def read_page_smart(file_path: str, page_num: int) -> str:
         if is_good_text:
             doc.close()
             return text
+        
         stats["ocr_runs"] += 1
         try:
-            pix = page.get_pixmap(dpi=300)
+            # УМЕНЬШАЕМ РАЗРЕШЕНИЕ, чтобы OCR не падал с ошибкой "Overly large image"
+            # Matrix(1.0, 1.0) делает картинку размером с оригинал (без увеличения)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), dpi=150)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
+            
+            # Принудительно уменьшаем, если все еще большая
+            if img.width > 2500 or img.height > 2500:
+                img.thumbnail((2500, 2500))
+
             ocr_text = pytesseract.image_to_string(img, lang='rus+eng').strip()
-            if len(ocr_text) < 50:
-                ocr_text_eng = pytesseract.image_to_string(img, lang='eng').strip()
-                if len(ocr_text_eng) > len(ocr_text): ocr_text = ocr_text_eng
             doc.close()
-            return ocr_text if len(ocr_text) > len(text) else text
+            
+            if len(ocr_text) < 50:
+                return ""
+            return ocr_text
         except Exception as e:
             logger.error(f"❌  [OCR ERROR] {e}")
             doc.close()
-            return text
+            return ""
     except Exception as e:
         logger.error(f"❌  [PDF ERROR] {e}")
         return ""
@@ -279,29 +311,26 @@ async def get_ai_response(topic: str, chat_id: int, class_num: str, page_num: in
         target_book = os.path.join(BOOKS_DIR, registry[class_num])
         if os.path.exists(target_book):
             source_text = await asyncio.to_thread(read_page_smart, target_book, page_num)
-    if source_text:
-        clean_text = re.sub(r'[^\x00-\x7F]+', ' ', source_text)
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        # УЛУЧШЕННЫЙ ПРОМПТ: просим объяснить именно задания на странице
-        system_prompt = (
-            f"Ты — дружелюбный репетитор по английскому языку. Отвечай простым и понятным языком, как для школьника. "
-            f"Перед тобой текст со страницы учебника.\n\n"
-            f"=== ТЕКСТ ===\n{clean_text}\n================\n\n"
-            f"Твоя задача:\n"
-            f"1. Выпиши 8-10 ключевых английских слов из текста с переводом (ЛЕКСИКА).\n"
-            f"2. Кратко перескажи суть текста (ОБЪЯСНЕНИЕ).\n"
-            f"3. Найди в тексте ЗАДАНИЯ (например, вопросы, пропущенные слова, упражнения) и подробно ОБЪЯСНИ, как их выполнить, и дай правильные ответы (ЗАДАНИЯ).\n\n"
-            f"Ответь СТРОГО в формате (без звездочек):\n"
-            f"ЛЕКСИКА:\n...\n\n"
-            f"ОБЪЯСНЕНИЕ:\n...\n\n"
-            f"ЗАДАНИЯ:\n..."
-        )
-    else:
-        system_prompt = (
-            f"Ты — дружелюбный репетитор по английскому языку. Отвечай простым и понятным языком, как для школьника. "
-            f"Тема запроса: {topic}\n\n"
-            f"Объясни эту тему так, чтобы было интересно и понятно. Приведи примеры.\n\n"
-        )
+    
+    if not source_text:
+        return "❌ Не удалось распознать текст на этой странице. Возможно, это плохое сканирование или картинка низкого качества. Попробуйте другую страницу."
+
+    clean_text = re.sub(r'[^\x00-\x7F]+', ' ', source_text)
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    system_prompt = (
+        f"Ты — дружелюбный репетитор по английскому языку. Отвечай простым и понятным языком, как для школьника. "
+        f"Перед тобой текст со страницы учебника.\n\n"
+        f"=== ТЕКСТ ===\n{clean_text}\n================\n\n"
+        f"Твоя задача:\n"
+        f"1. Выпиши 8-10 ключевых английских слов из текста с переводом (ЛЕКСИКА).\n"
+        f"2. Кратко перескажи суть текста (ОБЪЯСНЕНИЕ).\n"
+        f"3. Найди в тексте ЗАДАНИЯ (например, вопросы, пропущенные слова, упражнения) и подробно ОБЪЯСНИ, как их выполнить, и дай правильные ответы (ЗАДАНИЯ).\n\n"
+        f"Ответь СТРОГО в формате (без звездочек):\n"
+        f"ЛЕКСИКА:\n...\n\n"
+        f"ОБЪЯСНЕНИЕ:\n...\n\n"
+        f"ЗАДАНИЯ:\n..."
+    )
+    
     history = dialog_history.get(chat_id, [])
     messages = [{"role": "system", "text": system_prompt}] + history + [{"role": "user", "text": topic}]
     try:
@@ -395,16 +424,25 @@ async def handle_bot_started(event):
     await send_main_menu(chat_id, f"👋 {greeting}\n\nВыберите класс учебника или напишите тему для изучения:")
 
 async def handle_message(event):
-    async with message_lock:
-        user_id = get_user_id(event)
-        chat_id = get_chat_id(event)
-        if not chat_id: return
-        user_text = extract_text_from_event(event)
-        if user_text: user_text = user_text.strip()
-        text_lower = user_text.lower() if user_text else ""
-        user_name = get_user_name(event)
-        logger.info(f"\n{'='*40}\n📝  [EVENT] user_id={user_id} | Имя: {user_name} | Текст: '{user_text}'")
+    user_id = get_user_id(event)
+    chat_id = get_chat_id(event)
+    if not chat_id: return
+    
+    user_text = extract_text_from_event(event)
+    if user_text: user_text = user_text.strip()
+    text_lower = user_text.lower() if user_text else ""
+    user_name = get_user_name(event)
+    logger.info(f"\n{'='*40}\n📝  [EVENT] user_id={user_id} | Имя: {user_name} | Текст: '{user_text}'")
 
+    if user_id and user_name:
+        register_user(user_id, user_name)
+
+    chat_lock = get_chat_lock(chat_id)
+    if chat_lock.locked():
+        await bot.send_message(chat_id=chat_id, text="⏳ Подождите, я еще думаю над вашим прошлым запросом...")
+        return
+
+    async with chat_lock:
         file_url, file_name, file_size = get_file_info(event)
         if file_url and (user_id in ADMIN_USER_IDS or admin_states.get(chat_id) == "add_book"):
             if admin_states.get(chat_id) == "add_book":
@@ -419,7 +457,6 @@ async def handle_message(event):
                 return
 
         if text_lower == '/start':
-            register_user(user_id, user_name)
             admin_states.pop(chat_id, None)
             user_states.pop(chat_id, None)
             user_actions.pop(chat_id, None)
@@ -431,7 +468,6 @@ async def handle_message(event):
 
         if user_id in ADMIN_USER_IDS and text_lower in ['/admin', 'admin', '/админ']:
             admin_states[chat_id] = "menu"
-            async with lock: active_chats.discard(chat_id)
             await send_admin_menu(chat_id)
             return
 
@@ -459,241 +495,256 @@ async def handle_message(event):
             return
 
         if pages and selected_class and action == "explain":
-            if chat_id in active_chats:
-                await bot.send_message(chat_id=chat_id, text="⏳  Подождите...")
-                return
-            async with lock: active_chats.add(chat_id)
             await bot.send_message(chat_id=chat_id, text="⏳  Думаю...")
             try:
                 stats["requests"] += 1
                 page_num = pages[0]
                 answer = await get_ai_response(user_text, chat_id, selected_class, page_num)
                 if answer:
-                    await bot.send_message(chat_id=chat_id, text=answer)
-                    await asyncio.sleep(0.5)
-                    await send_main_menu(chat_id)
+                    kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]]).pack()
+                    await bot.send_message(chat_id=chat_id, text=answer, attachments=[kb])
             except Exception as e:
                 logger.error(f"💥  [ERROR] {e}")
                 await bot.send_message(chat_id=chat_id, text="⚠️  Ошибка.")
-            finally:
-                async with lock: active_chats.discard(chat_id)
             return
 
         if user_text and not selected_class:
-            if chat_id in active_chats:
-                await bot.send_message(chat_id=chat_id, text="⏳  Подождите...")
-                return
-            async with lock: active_chats.add(chat_id)
             await bot.send_message(chat_id=chat_id, text="⏳  Думаю...")
             try:
                 stats["requests"] += 1
                 answer = await get_ai_response(user_text, chat_id, "all", None)
                 if answer:
-                    await bot.send_message(chat_id=chat_id, text=answer)
-                    await asyncio.sleep(0.5)
-                    await send_main_menu(chat_id)
+                    kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]]).pack()
+                    await bot.send_message(chat_id=chat_id, text=answer, attachments=[kb])
             except Exception as e:
                 logger.error(f"💥  [ERROR] {e}")
                 await bot.send_message(chat_id=chat_id, text="⚠️  Ошибка.")
-            finally:
-                async with lock: active_chats.discard(chat_id)
             return
 
 async def handle_callback(event):
-    async with message_lock:
-        user_id = get_user_id(event)
-        user_name = get_user_name(event)
-        recipient = getattr(event.message, 'recipient', None) if hasattr(event, 'message') else None
-        chat_id = getattr(recipient, 'chat_id', None) if recipient else get_chat_id(event)
+    user_id = get_user_id(event)
+    user_name = get_user_name(event)
+    recipient = getattr(event.message, 'recipient', None) if hasattr(event, 'message') else None
+    chat_id = getattr(recipient, 'chat_id', None) if recipient else get_chat_id(event)
 
-        payload = None
-        for attr in ['payload', 'data', 'callback_data']:
-            val = getattr(event, attr, None)
-            if val: payload = val; break
-        if not payload:
-            callback = getattr(event, 'callback', None)
-            if callback:
-                for attr in ['payload', 'data']:
-                    val = getattr(callback, attr, None)
-                    if val: payload = val; break
-        if not payload:
-            msg = getattr(event, 'message', None)
-            if msg:
-                body = getattr(msg, 'body', None)
-                if body:
-                    payload = getattr(body, 'payload', None)
-        if not payload:
-            payload = str(event)
-            match = re.search(r'payload[=:]\s*[\'"]?([a-zA-Z0-9_:]+)', payload)
-            if match:
-                payload = match.group(1)
+    payload = None
+    for attr in ['payload', 'data', 'callback_data']:
+        val = getattr(event, attr, None)
+        if val: payload = val; break
+    if not payload:
+        callback = getattr(event, 'callback', None)
+        if callback:
+            for attr in ['payload', 'data']:
+                val = getattr(callback, attr, None)
+                if val: payload = val; break
+    if not payload:
+        msg = getattr(event, 'message', None)
+        if msg:
+            body = getattr(msg, 'body', None)
+            if body:
+                payload = getattr(body, 'payload', None)
+    if not payload:
+        payload = str(event)
+        match = re.search(r'payload[=:]\s*[\'"]?([a-zA-Z0-9_:]+)', payload)
+        if match:
+            payload = match.group(1)
 
-        logger.info(f"\n{'='*40}\n🔘  [CALLBACK] user_id={user_id} | chat_id={chat_id} | Payload: '{payload}'")
+    logger.info(f"\n{'='*40}\n🔘  [CALLBACK] user_id={user_id} | chat_id={chat_id} | Payload: '{payload}'")
 
-        if not payload: return
+    if not payload: return
 
-        if user_name and user_id:
-            register_user(user_id, user_name)
+    if user_name and user_id:
+        register_user(user_id, user_name)
 
-        if payload == "back_to_classes":
-            user_states.pop(chat_id, None)
-            user_actions.pop(chat_id, None)
-            admin_states.pop(chat_id, None)
-            await send_main_menu(chat_id)
-            return
+    if payload == "back_to_admin":
+        admin_states[chat_id] = "menu"
+        await send_admin_menu(chat_id)
+        return
 
-        if payload == "my_progress":
-            users = load_users()
-            uid = str(user_id)
-            if uid in users and user_name and users[uid].get("name") != user_name:
-                users[uid]["name"] = user_name
-                save_users(users)
+    if payload == "back_to_classes":
+        user_states.pop(chat_id, None)
+        user_actions.pop(chat_id, None)
+        admin_states.pop(chat_id, None)
+        await send_main_menu(chat_id)
+        return
 
-            if uid in users:
-                info = users[uid]
-                quizzes = info.get('quizzes', [])
-                best = info.get('best_score', 0)
-                best_text = f"{best} из 3" if best > 0 else "Пока нет результатов"
-                msg = f"📊 Ваш прогресс:\n\n👤 Имя: {info.get('name', 'Неизвестно')}\n📅 Первый вход: {info.get('first_seen', 'Неизвестно')}\n🎮 Пройдено квизов: {len(quizzes)}\n🏆 Лучший результат: {best_text}"
-                if quizzes:
-                    msg += "\n\nПоследние квизы:\n"
-                    for q in quizzes[-3:]:
-                        msg += f"• {q.get('date', '')}: {q.get('score', 0)}/3 (класс {q.get('class', '?')})\n"
+    if payload == "my_progress":
+        users = load_users()
+        uid = str(user_id)
+        
+        if uid in users:
+            info = users[uid]
+            quizzes = info.get('quizzes', [])
+            best = info.get('best_score', 0)
+            best_text = f"{best} из 3" if best > 0 else "Пока нет результатов"
+            display_name = info.get('name', '')
+            if not display_name: display_name = f"Пользователь (ID: {uid})"
+            
+            msg = f"📊 Ваш прогресс:\n\n👤 Имя: {display_name}\n📅 Первый вход: {info.get('first_seen', 'Неизвестно')}\n🎮 Пройдено квизов: {len(quizzes)}\n🏆 Лучший результат: {best_text}"
+            if quizzes:
+                msg += "\n\nПоследние квизы:\n"
+                for q in quizzes[-3:]:
+                    msg += f"• {q.get('date', '')}: {q.get('score', 0)}/3 (класс {q.get('class', '?')})\n"
+        else:
+            msg = "📊 Пока нет данных. Начните с выбора класса!"
+        kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]]).pack()
+        await bot.send_message(chat_id=chat_id, text=msg, attachments=[kb])
+        return
+
+    if payload == "admin_login":
+        admin_states[chat_id] = "menu"
+        await send_admin_menu(chat_id)
+        return
+
+    if payload == "admin_stats":
+        users = load_users()
+        if not users:
+            msg = "📈 Статистика:\nПользователей: 0"
+        else:
+            active_users = [u for u in users.values() if u.get('best_score', 0) > 0]
+            sorted_users = sorted(active_users, key=lambda x: x.get('best_score', 0), reverse=True)[:5]
+            
+            if not sorted_users:
+                msg = "🏆 Пока никто не прошел ни одного квиза."
             else:
-                msg = "📊 Пока нет данных. Начните с выбора класса!"
-            kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]]).pack()
-            await bot.send_message(chat_id=chat_id, text=msg, attachments=[kb])
-            return
-
-        if payload == "admin_login":
-            admin_states[chat_id] = "menu"
-            async with lock: active_chats.discard(chat_id)
-            await send_admin_menu(chat_id)
-            return
-
-        if payload.startswith("select_class:"):
-            class_num = payload.split(":")[1]
-            user_states[chat_id] = class_num
-            dialog_history.pop(chat_id, None)
-            await bot.send_message(chat_id=chat_id, text=f"✅  Выбран {class_num} класс.\n\nЧто будем делать?", attachments=[get_class_menu_keyboard(class_num)])
-            return
-
-        if payload == "fipi_oge":
-            await bot.send_message(chat_id=chat_id, text="🎓 Подготовка к ОГЭ по английскому языку.\n\nОткрытый банк заданий ФИПИ:\nhttps://oge.fipi.ru/bank/index.php?proj=8BBD5C99F37898B6402964AB11955663", attachments=[ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_classes")]]).pack()])
-            return
-
-        if payload == "fipi_ege":
-            await bot.send_message(chat_id=chat_id, text="🎓 Подготовка к ЕГЭ по английскому языку.\n\nОткрытый банк заданий ФИПИ:\nhttps://ege.fipi.ru/bank/index.php?proj=4B53A6CB75B0B5E1427E596EB4931A2A", attachments=[ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_classes")]]).pack()])
-            return
-
-        if payload == "action_explain":
-            user_actions[chat_id] = "explain"
-            await bot.send_message(chat_id=chat_id, text="Введите номер страницы, и я объясню текст и задания на ней:")
-            return
-
-        if payload == "action_quiz":
-            user_actions[chat_id] = "quiz"
-            await bot.send_message(chat_id=chat_id, text="Введите номер страницы (или несколько через запятую, например: 65, 66, 87):")
-            return
-
-        if payload.startswith("no_book:"):
-            class_num = payload.split(":")[1]
-            await bot.send_message(chat_id=chat_id, text=f"⚠️  Учебник для {class_num} класса пока не добавлен.")
-            return
-
-        if payload.startswith("quiz_answer:"):
-            if chat_id not in quiz_sessions: return
-            session = quiz_sessions[chat_id]
-            answer_idx = int(payload.split(":")[1])
-            current_q = session["questions"][session["current"]]
-            if answer_idx == current_q["correct"]:
-                session["score"] += 1
-                await bot.send_message(chat_id=chat_id, text="✅ Правильно!")
-            else:
-                correct_answer = current_q["options"][current_q["correct"]]
-                await bot.send_message(chat_id=chat_id, text=f"❌ Неправильно. Правильный ответ: {correct_answer}")
-            session["current"] += 1
-            if session["current"] >= len(session["questions"]):
-                stats["quiz_played"] += 1
-                score = session["score"]
-                total = len(session["questions"])
-
-                users = load_users()
-                uid = str(user_id)
-                if uid in users:
-                    if 'quizzes' not in users[uid]: users[uid]['quizzes'] = []
-                    users[uid]['quizzes'].append({
-                        'date': datetime.now().strftime("%d.%m.%Y %H:%M"),
-                        'score': score,
-                        'class': session.get('class', '?'),
-                        'pages': session.get('pages', [])
-                    })
-                    if score > users[uid].get('best_score', 0):
-                        users[uid]['best_score'] = score
-                    save_users(users)
-
-                await bot.send_message(chat_id=chat_id, text=f"🏁 Квиз завершён!\nВаш результат: {score} из {total}.")
-                quiz_sessions.pop(chat_id, None)
-                await send_main_menu(chat_id)
-            else:
-                await send_quiz_question(chat_id)
-            return
-
-        if payload == "admin_stats":
-            users = load_users()
-            if not users:
-                msg = "📈 Статистика:\nПользователей: 0"
-            else:
-                sorted_users = sorted(users.values(), key=lambda x: x.get('best_score', 0), reverse=True)[:5]
                 msg = "🏆 Топ-5 активных учеников:\n\n"
                 for i, u in enumerate(sorted_users, 1):
-                    msg += f"{i}. {u.get('name', '?')} — {u.get('best_score', 0)} из 3\n"
-            await bot.send_message(chat_id=chat_id, text=msg)
-        elif payload == "admin_users":
+                    name = u.get('name', '')
+                    if not name: name = "Без имени"
+                    msg += f"{i}. {name} — {u.get('best_score', 0)} из 3\n"
+        
+        kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_admin")]]).pack()
+        await bot.send_message(chat_id=chat_id, text=msg, attachments=[kb])
+        return
+        
+    if payload == "admin_users":
+        users = load_users()
+        if not users: msg = "👥 Пока никто не заходил."
+        else:
+            msg = "👥 Список пользователей:\n\n"
+            for uid, info in sorted(users.items(), key=lambda x: x[1].get('first_seen', '')):
+                name = info.get('name', '')
+                if not name: name = "Без имени"
+                msg += f"• {name} (ID: {uid}) — {info.get('first_seen', '?')}\n"
+        kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_admin")]]).pack()
+        await bot.send_message(chat_id=chat_id, text=msg, attachments=[kb])
+        return
+        
+    if payload == "admin_add_book":
+        admin_states[chat_id] = "add_book"
+        await bot.send_message(chat_id=chat_id, text="📤  Отправьте PDF файл учебника прямо в этот чат.")
+        return
+        
+    if payload == "admin_list_books":
+        registry = load_registry()
+        if not registry: msg = "📋 Пусто."
+        else:
+            msg = "📋 Учебники:\n\n"
+            for cls, f in sorted(registry.items()):
+                msg += f"📚 {cls} класс: {f}\n"
+        kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_admin")]]).pack()
+        await bot.send_message(chat_id=chat_id, text=msg, attachments=[kb])
+        return
+
+    if payload.startswith("select_class:"):
+        class_num = payload.split(":")[1]
+        user_states[chat_id] = class_num
+        dialog_history.pop(chat_id, None)
+        await bot.send_message(chat_id=chat_id, text=f"✅  Выбран {class_num} класс.\n\nЧто будем делать?", attachments=[get_class_menu_keyboard(class_num)])
+        return
+
+    if payload == "fipi_oge":
+        kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_classes")]]).pack()
+        await bot.send_message(chat_id=chat_id, text="🎓 Подготовка к ОГЭ по английскому языку.\n\nОткрытый банк заданий ФИПИ:\nhttps://oge.fipi.ru/bank/index.php?proj=8BBD5C99F37898B6402964AB11955663", attachments=[kb])
+        return
+
+    if payload == "fipi_ege":
+        kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_classes")]]).pack()
+        await bot.send_message(chat_id=chat_id, text="🎓 Подготовка к ЕГЭ по английскому языку.\n\nОткрытый банк заданий ФИПИ:\nhttps://ege.fipi.ru/bank/index.php?proj=4B53A6CB75B0B5E1427E596EB4931A2A", attachments=[kb])
+        return
+
+    if payload == "action_explain":
+        user_actions[chat_id] = "explain"
+        await bot.send_message(chat_id=chat_id, text="Введите номер страницы, и я объясню текст и задания на ней:")
+        return
+
+    if payload == "action_quiz":
+        user_actions[chat_id] = "quiz"
+        await bot.send_message(chat_id=chat_id, text="Введите номер страницы (или несколько через запятую, например: 65, 66, 87):")
+        return
+
+    if payload.startswith("no_book:"):
+        class_num = payload.split(":")[1]
+        await bot.send_message(chat_id=chat_id, text=f"⚠️  Учебник для {class_num} класса пока не добавлен.")
+        return
+
+    if payload.startswith("quiz_answer:"):
+        if chat_id not in quiz_sessions: return
+        session = quiz_sessions[chat_id]
+        answer_idx = int(payload.split(":")[1])
+        current_q = session["questions"][session["current"]]
+        if answer_idx == current_q["correct"]:
+            session["score"] += 1
+            await bot.send_message(chat_id=chat_id, text="✅ Правильно!")
+        else:
+            correct_answer = current_q["options"][current_q["correct"]]
+            await bot.send_message(chat_id=chat_id, text=f"❌ Неправильно. Правильный ответ: {correct_answer}")
+        session["current"] += 1
+        if session["current"] >= len(session["questions"]):
+            stats["quiz_played"] += 1
+            score = session["score"]
+            total = len(session["questions"])
+
             users = load_users()
-            if not users: msg = "👥 Пока никто не заходил."
-            else:
-                msg = "👥 Список пользователей:\n\n"
-                for uid, info in sorted(users.items(), key=lambda x: x[1].get('first_seen', '')):
-                    msg += f"• {info.get('name', '?')} (ID: {uid}) — {info.get('first_seen', '?')}\n"
-            await bot.send_message(chat_id=chat_id, text=msg)
-        elif payload == "admin_add_book":
-            admin_states[chat_id] = "add_book"
-            await bot.send_message(chat_id=chat_id, text="📤  Отправьте PDF файл учебника прямо в этот чат.")
-        elif payload == "admin_list_books":
+            uid = str(user_id)
+            if uid in users:
+                if 'quizzes' not in users[uid]: users[uid]['quizzes'] = []
+                users[uid]['quizzes'].append({
+                    'date': get_moscow_time(),
+                    'score': score,
+                    'class': session.get('class', '?'),
+                    'pages': session.get('pages', [])
+                })
+                if score > users[uid].get('best_score', 0):
+                    users[uid]['best_score'] = score
+                save_users(users)
+
+            kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]]).pack()
+            await bot.send_message(chat_id=chat_id, text=f"🏁 Квиз завершён!\nВаш результат: {score} из {total}.", attachments=[kb])
+            quiz_sessions.pop(chat_id, None)
+        else:
+            await send_quiz_question(chat_id)
+        return
+
+    if payload.startswith("save_book_class:"):
+        class_num = payload.split(":")[1]
+        if chat_id not in pending_uploads: return
+        upload_info = pending_uploads[chat_id]
+        new_filename = f"class_{class_num}.pdf"
+        new_path = os.path.join(BOOKS_DIR, new_filename)
+        try:
+            if os.path.exists(new_path): os.remove(new_path)
+            os.rename(upload_info['file_path'], new_path)
             registry = load_registry()
-            if not registry: msg = "📋 Пусто."
-            else:
-                msg = "📋 Учебники:\n\n"
-                for cls, f in sorted(registry.items()):
-                    msg += f"📚 {cls} класс: {f}\n"
-            await bot.send_message(chat_id=chat_id, text=msg)
-        elif payload.startswith("save_book_class:"):
-            class_num = payload.split(":")[1]
-            if chat_id not in pending_uploads: return
-            upload_info = pending_uploads[chat_id]
-            new_filename = f"class_{class_num}.pdf"
-            new_path = os.path.join(BOOKS_DIR, new_filename)
-            try:
-                if os.path.exists(new_path): os.remove(new_path)
-                os.rename(upload_info['file_path'], new_path)
-                registry = load_registry()
-                registry[class_num] = new_filename
-                save_registry(registry)
-                pending_uploads.pop(chat_id, None)
-                admin_states.pop(chat_id, None)
-                await bot.send_message(chat_id=chat_id, text=f"✅ Учебник для {class_num} добавлен!")
-                await send_admin_menu(chat_id)
-            except Exception as e:
-                await bot.send_message(chat_id=chat_id, text=f"❌ Ошибка: {e}")
-        elif payload == "cancel_upload":
-            if chat_id in pending_uploads:
-                if os.path.exists(pending_uploads[chat_id]['file_path']):
-                    os.remove(pending_uploads[chat_id]['file_path'])
-                pending_uploads.pop(chat_id, None)
+            registry[class_num] = new_filename
+            save_registry(registry)
+            pending_uploads.pop(chat_id, None)
             admin_states.pop(chat_id, None)
-            await bot.send_message(chat_id=chat_id, text="❌ Отменено.")
+            await bot.send_message(chat_id=chat_id, text=f"✅ Учебник для {class_num} добавлен!")
             await send_admin_menu(chat_id)
+        except Exception as e:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Ошибка: {e}")
+        return
+
+    if payload == "cancel_upload":
+        if chat_id in pending_uploads:
+            if os.path.exists(pending_uploads[chat_id]['file_path']):
+                os.remove(pending_uploads[chat_id]['file_path'])
+            pending_uploads.pop(chat_id, None)
+        admin_states.pop(chat_id, None)
+        await bot.send_message(chat_id=chat_id, text="❌ Отменено.")
+        await send_admin_menu(chat_id)
+        return
 
 async def send_quiz_question(chat_id):
     session = quiz_sessions[chat_id]
