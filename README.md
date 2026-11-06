@@ -31,8 +31,8 @@
 1. Установите Docker и Docker Compose на ваш сервер.
 
 2. Скопируйте репозиторий на сервер:
-   git clone https://github.com/ваш_ник/ваш_репозиторий.git
-   cd ваш_репозиторий
+   git clone https://github.com/teacherit1984/english-without-mistakes/tree/main
+   cd english-without-mistakes
 
 3. Создайте файл .env в корне проекта и добавьте туда ключи:
    MAX_BOT_TOKEN="ваш_токен"
