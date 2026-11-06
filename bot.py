@@ -1,3 +1,4 @@
+cat << 'EOF' > /home/user/bot.py
 import os
 import re
 import io
@@ -206,20 +207,25 @@ async def send_main_menu(chat_id, custom_text="📚  Выберите класс
     await bot.send_message(chat_id=chat_id, text=custom_text, attachments=[get_main_menu_keyboard()])
 
 def get_class_menu_keyboard(class_num):
-    buttons = [
-        [CallbackButton(text="📖 Объяснить страницу", payload="action_explain")],
-        [CallbackButton(text="🎮 Пройти квиз", payload="action_quiz")],
-        [CallbackButton(text="⬅️ Назад к классам", payload="back_to_classes")]
-    ]
+    buttons = []
+    if class_num == "9":
+        buttons.append([CallbackButton(text="🎓 Подготовка к ОГЭ (ФИПИ)", payload="fipi_oge")])
+    elif class_num == "11":
+        buttons.append([CallbackButton(text="🎓 Подготовка к ЕГЭ (ФИПИ)", payload="fipi_ege")])
+        
+    buttons.append([CallbackButton(text="📖 Объяснить страницу", payload="action_explain")])
+    buttons.append([CallbackButton(text="🎮 Пройти квиз", payload="action_quiz")])
+    buttons.append([CallbackButton(text="⬅️ Назад к классам", payload="back_to_classes")])
     return ButtonsPayload(buttons=buttons).pack()
 
 def get_admin_keyboard():
+    # Убрали кнопку "Выйти", оставили "Назад в меню"
     buttons = [
         [CallbackButton(text="🏆 Топ пользователей", payload="admin_stats")],
         [CallbackButton(text="👥 Пользователи", payload="admin_users")],
         [CallbackButton(text="📚 Добавить учебник", payload="admin_add_book")],
         [CallbackButton(text="📋 Список учебников", payload="admin_list_books")],
-        [CallbackButton(text="❌ Выйти", payload="admin_exit")]
+        [CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]
     ]
     return ButtonsPayload(buttons=buttons).pack()
 
@@ -276,15 +282,19 @@ async def get_ai_response(topic: str, chat_id: int, class_num: str, page_num: in
     if source_text:
         clean_text = re.sub(r'[^\x00-\x7F]+', ' ', source_text)
         clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        # ЖЕСТКИЙ ПРОМПТ: требуем все 3 блока
+        # УЛУЧШЕННЫЙ ПРОМПТ: просим объяснить именно задания на странице
         system_prompt = (
             f"Ты — дружелюбный репетитор по английскому языку. Отвечай простым и понятным языком, как для школьника. "
-            f"Разбери следующий текст.\n\n"
+            f"Перед тобой текст со страницы учебника.\n\n"
             f"=== ТЕКСТ ===\n{clean_text}\n================\n\n"
+            f"Твоя задача:\n"
+            f"1. Выпиши 8-10 ключевых английских слов из текста с переводом (ЛЕКСИКА).\n"
+            f"2. Кратко перескажи суть текста (ОБЪЯСНЕНИЕ).\n"
+            f"3. Найди в тексте ЗАДАНИЯ (например, вопросы, пропущенные слова, упражнения) и подробно ОБЪЯСНИ, как их выполнить, и дай правильные ответы (ЗАДАНИЯ).\n\n"
             f"Ответь СТРОГО в формате (без звездочек):\n"
-            f"ЛЕКСИКА:\nВыпиши 8-10 ключевых английских слов из текста с переводом.\n\n"
-            f"ОБЪЯСНЕНИЕ:\nКратко перескажи текст (2-3 предложения).\n\n"
-            f"ЗАДАНИЯ:\nПридумай 3 задания по тексту (например: вставь пропущенное слово, ответь на вопрос)."
+            f"ЛЕКСИКА:\n...\n\n"
+            f"ОБЪЯСНЕНИЕ:\n...\n\n"
+            f"ЗАДАНИЯ:\n..."
         )
     else:
         system_prompt = (
@@ -528,6 +538,7 @@ async def handle_callback(event):
         if payload == "back_to_classes":
             user_states.pop(chat_id, None)
             user_actions.pop(chat_id, None)
+            admin_states.pop(chat_id, None)
             await send_main_menu(chat_id)
             return
 
@@ -550,7 +561,8 @@ async def handle_callback(event):
                         msg += f"• {q.get('date', '')}: {q.get('score', 0)}/3 (класс {q.get('class', '?')})\n"
             else:
                 msg = "📊 Пока нет данных. Начните с выбора класса!"
-            await bot.send_message(chat_id=chat_id, text=msg)
+            kb = ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад в меню", payload="back_to_classes")]]).pack()
+            await bot.send_message(chat_id=chat_id, text=msg, attachments=[kb])
             return
 
         if payload == "admin_login":
@@ -566,9 +578,17 @@ async def handle_callback(event):
             await bot.send_message(chat_id=chat_id, text=f"✅  Выбран {class_num} класс.\n\nЧто будем делать?", attachments=[get_class_menu_keyboard(class_num)])
             return
 
+        if payload == "fipi_oge":
+            await bot.send_message(chat_id=chat_id, text="🎓 Подготовка к ОГЭ по английскому языку.\n\nОткрытый банк заданий ФИПИ:\nhttps://oge.fipi.ru/bank/index.php?proj=8BBD5C99F37898B6402964AB11955663", attachments=[ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_classes")]]).pack()])
+            return
+
+        if payload == "fipi_ege":
+            await bot.send_message(chat_id=chat_id, text="🎓 Подготовка к ЕГЭ по английскому языку.\n\nОткрытый банк заданий ФИПИ:\nhttps://ege.fipi.ru/bank/index.php?proj=4B53A6CB75B0B5E1427E596EB4931A2A", attachments=[ButtonsPayload(buttons=[[CallbackButton(text="⬅️ Назад", payload="back_to_classes")]]).pack()])
+            return
+
         if payload == "action_explain":
             user_actions[chat_id] = "explain"
-            await bot.send_message(chat_id=chat_id, text="Введите номер страницы, и я объясню текст:")
+            await bot.send_message(chat_id=chat_id, text="Введите номер страницы, и я объясню текст и задания на ней:")
             return
 
         if payload == "action_quiz":
@@ -648,9 +668,6 @@ async def handle_callback(event):
                 for cls, f in sorted(registry.items()):
                     msg += f"📚 {cls} класс: {f}\n"
             await bot.send_message(chat_id=chat_id, text=msg)
-        elif payload == "admin_exit":
-            admin_states.pop(chat_id, None)
-            await bot.send_message(chat_id=chat_id, text="🔒 Вышли из админки.")
         elif payload.startswith("save_book_class:"):
             class_num = payload.split(":")[1]
             if chat_id not in pending_uploads: return
@@ -707,3 +724,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+EOF
