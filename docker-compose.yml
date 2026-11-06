@@ -1,1 +1,12 @@
+version: '3.8'
 
+services:
+  bot:
+    build: .
+    container_name: english-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./books:/app/books
+      - ./users.json:/app/users.json
